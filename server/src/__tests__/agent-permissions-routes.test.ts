@@ -91,6 +91,11 @@ const mockIssueApprovalService = vi.hoisted(() => ({
 
 const mockIssueService = vi.hoisted(() => ({
   list: vi.fn(),
+  listDependencyReadiness: vi.fn(),
+}));
+
+const mockIssueRecoveryActionService = vi.hoisted(() => ({
+  listActiveForIssues: vi.fn(),
 }));
 
 const mockSecretService = vi.hoisted(() => ({
@@ -118,6 +123,8 @@ const mockEnvironmentService = vi.hoisted(() => ({
 const mockInstanceSettingsService = vi.hoisted(() => ({
   getGeneral: vi.fn(),
 }));
+const mockResolveWorktreeRunExecutionActivationState = vi.hoisted(() => vi.fn());
+const mockIsTruthyRuntimeEnvValue = vi.hoisted(() => vi.fn());
 
 function registerModuleMocks() {
   vi.doMock("@paperclipai/adapter-opencode-local/server", async () => {
@@ -192,6 +199,8 @@ function registerModuleMocks() {
 
   vi.doMock("../services/instance-settings.js", () => ({
     instanceSettingsService: () => mockInstanceSettingsService,
+    resolveWorktreeRunExecutionActivationState: mockResolveWorktreeRunExecutionActivationState,
+    isTruthyRuntimeEnvValue: mockIsTruthyRuntimeEnvValue,
   }));
 
   vi.doMock("../services/index.js", () => ({
@@ -205,6 +214,7 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     ISSUE_LIST_DEFAULT_LIMIT: 500,
     issueApprovalService: () => mockIssueApprovalService,
+    issueRecoveryActionService: () => mockIssueRecoveryActionService,
     issueService: () => mockIssueService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
@@ -335,6 +345,8 @@ describe.sequential("agent permission routes", () => {
     mockHeartbeatService.cancelInvocationsForAgents.mockReset();
     mockIssueApprovalService.linkManyForApproval.mockReset();
     mockIssueService.list.mockReset();
+    mockIssueService.listDependencyReadiness.mockReset();
+    mockIssueRecoveryActionService.listActiveForIssues.mockReset();
     mockSecretService.normalizeAdapterConfigForPersistence.mockReset();
     mockSecretService.resolveAdapterConfigForRuntime.mockReset();
     mockAgentInstructionsService.materializeManagedBundle.mockReset();
@@ -345,6 +357,8 @@ describe.sequential("agent permission routes", () => {
     mockGetTelemetryClient.mockReset();
     mockSyncInstructionsBundleConfigFromFilePath.mockReset();
     mockInstanceSettingsService.getGeneral.mockReset();
+    mockResolveWorktreeRunExecutionActivationState.mockReset();
+    mockIsTruthyRuntimeEnvValue.mockReset();
     mockEnvironmentService.getById.mockReset();
     mockEnsureOpenCodeModelConfiguredAndAvailable.mockReset();
     mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
@@ -387,6 +401,8 @@ describe.sequential("agent permission routes", () => {
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
     mockCompanySkillService.resolveRequestedSkillKeys.mockImplementation(async (_companyId, requested) => requested);
     mockBudgetService.upsertPolicy.mockResolvedValue(undefined);
+    mockIssueService.listDependencyReadiness.mockResolvedValue(new Map());
+    mockIssueRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
     mockAgentInstructionsService.materializeManagedBundle.mockImplementation(
       async (agent: Record<string, unknown>, files: Record<string, string>) => ({
         bundle: null,
@@ -409,6 +425,11 @@ describe.sequential("agent permission routes", () => {
     mockInstanceSettingsService.getGeneral.mockResolvedValue({
       censorUsernameInLogs: false,
     });
+    mockResolveWorktreeRunExecutionActivationState.mockResolvedValue({
+      armed: false,
+      cutoff: new Date(0),
+    });
+    mockIsTruthyRuntimeEnvValue.mockReturnValue(false);
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -1686,6 +1707,70 @@ describe.sequential("agent permission routes", () => {
       status: "backlog,todo,in_progress,in_review,blocked,done",
       limit: 500,
     });
+  });
+
+  it("includes assigned in_review issues in inbox-lite", async () => {
+    mockIssueService.list.mockResolvedValue([
+      {
+        id: "issue-1",
+        identifier: "PAP-1134",
+        title: "Pending interaction handoff",
+        status: "in_review",
+        priority: "low",
+        projectId: null,
+        goalId: null,
+        parentId: null,
+        updatedAt: "2026-07-18T07:36:32.045Z",
+        createdAt: "2026-07-18T07:35:39.969Z",
+        activeRun: null,
+      },
+    ]);
+    mockIssueService.listDependencyReadiness.mockResolvedValue(new Map([
+      ["issue-1", {
+        isDependencyReady: true,
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+      }],
+    ]));
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .get("/api/agents/me/inbox-lite"));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      {
+        id: "issue-1",
+        identifier: "PAP-1134",
+        title: "Pending interaction handoff",
+        status: "in_review",
+        priority: "low",
+        projectId: null,
+        goalId: null,
+        parentId: null,
+        updatedAt: "2026-07-18T07:36:32.045Z",
+        activeRun: null,
+        activeRecoveryAction: null,
+        dependencyReady: true,
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+      },
+    ]);
+    expect(mockIssueService.list).toHaveBeenCalledWith(companyId, {
+      assigneeAgentId: agentId,
+      status: "todo,in_progress,in_review,blocked",
+      includeRoutineExecutions: true,
+      limit: 500,
+    });
+    expect(mockIssueService.listDependencyReadiness).toHaveBeenCalledWith(companyId, ["issue-1"]);
+    expect(mockIssueRecoveryActionService.listActiveForIssues).toHaveBeenCalledWith(companyId, ["issue-1"]);
   });
 
   describe("agent configuration read gate", () => {
